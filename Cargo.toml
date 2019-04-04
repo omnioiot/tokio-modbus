@@ -15,22 +15,25 @@ bytes = "0.4"
 byteorder = "1"
 futures = "0.1"
 log = "0.4"
+modbus-core = "0.0"
 smallvec = { version = "0.6", default-features = false }
 tokio-io = "0.1"
 tokio-core = "0.1"
 tokio-codec = "0.1"
 tokio-proto = "0.1"
 tokio-service = "0.1"
-
 tokio-serial = { version = "3.2", optional = true }
+
+[patch.crates-io]
+modbus-core = { git = "https://github.com/slowtec/modbus-core", branch = "draft" }
 
 [dev-dependencies]
 env_logger = "0.6"
 
 [features]
 default = ["tcp", "rtu", "sync"]
-rtu = ["tokio-serial"]
-tcp = []
+rtu = ["modbus-core/rtu", "tokio-serial"]
+tcp = ["modbus-core/tcp"]
 sync = []
 
 [badges]

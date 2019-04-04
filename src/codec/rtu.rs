@@ -5,6 +5,7 @@ use crate::slave::SlaveId;
 
 use bytes::{BigEndian, BufMut, Bytes, BytesMut};
 use log::{debug, error, warn};
+use modbus_core::{self as mb, rtu::crc16};
 use smallvec::SmallVec;
 use std::io::{Cursor, Error, ErrorKind, Result};
 use tokio_codec::{Decoder, Encoder};
@@ -117,95 +118,17 @@ pub(crate) struct ServerCodec {
 }
 
 fn get_request_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
-    if adu_buf.len() < 2 {
-        return Ok(None);
-    }
-    let fn_code = adu_buf[1];
-    let len = match fn_code {
-        0x01...0x06 => Some(5),
-        0x07 | 0x0B | 0x0C | 0x11 => Some(1),
-        0x0F | 0x10 => {
-            if adu_buf.len() > 4 {
-                Some(6 + adu_buf[4] as usize)
-            } else {
-                // incomplete frame
-                None
-            }
-        }
-        0x16 => Some(7),
-        0x18 => Some(3),
-        0x17 => {
-            if adu_buf.len() > 10 {
-                Some(10 + adu_buf[10] as usize)
-            } else {
-                // incomplete frame
-                None
-            }
-        }
-        _ => {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Invalid function code: 0x{:0>2X}", fn_code),
-            ));
-        }
-    };
-    Ok(len)
+    mb::rtu::request_pdu_len(adu_buf)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))
 }
 
 fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
-    if adu_buf.len() < 2 {
-        return Ok(None);
-    }
-    let fn_code = adu_buf[1];
-    let len = match fn_code {
-        0x01...0x04 | 0x0C | 0x17 => {
-            if adu_buf.len() > 2 {
-                Some(2 + adu_buf[2] as usize)
-            } else {
-                // incomplete frame
-                None
-            }
-        }
-        0x05 | 0x06 | 0x0B | 0x0F | 0x10 => Some(5),
-        0x07 => Some(2),
-        0x16 => Some(7),
-        0x18 => {
-            if adu_buf.len() > 3 {
-                Some(3 + Cursor::new(&adu_buf[2..=3]).read_u16::<BigEndian>()? as usize)
-            } else {
-                // incomplete frame
-                None
-            }
-        }
-        0x81...0xAB => Some(2),
-        _ => {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Invalid function code: 0x{:0>2X}", fn_code),
-            ));
-        }
-    };
-    Ok(len)
-}
-
-fn calc_crc(data: &[u8]) -> u16 {
-    let mut crc = 0xFFFF;
-    for x in data {
-        crc ^= u16::from(*x);
-        for _ in 0..8 {
-            if (crc & 0x0001) != 0 {
-                crc >>= 1;
-                crc ^= 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    (crc << 8 | crc >> 8)
+    mb::rtu::response_pdu_len(adu_buf)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))
 }
 
 fn check_crc(adu_data: &[u8], expected_crc: u16) -> Result<()> {
-    let actual_crc = calc_crc(&adu_data);
+    let actual_crc = crc16(&adu_data);
     if expected_crc != actual_crc {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -360,7 +283,7 @@ impl Encoder for ClientCodec {
         buf.reserve(pdu_data.len() + 3);
         buf.put_u8(hdr.slave_id);
         buf.put_slice(&*pdu_data);
-        let crc = calc_crc(buf);
+        let crc = crc16(buf);
         buf.put_u16_be(crc);
         Ok(())
     }
@@ -376,7 +299,7 @@ impl Encoder for ServerCodec {
         buf.reserve(pdu_data.len() + 3);
         buf.put_u8(hdr.slave_id);
         buf.put_slice(&*pdu_data);
-        let crc = calc_crc(buf);
+        let crc = crc16(buf);
         buf.put_u16_be(crc);
         Ok(())
     }
@@ -386,15 +309,6 @@ impl Encoder for ServerCodec {
 mod tests {
     use super::*;
     use bytes::Bytes;
-
-    #[test]
-    fn test_calc_crc() {
-        let msg = vec![0x01, 0x03, 0x08, 0x2B, 0x00, 0x02];
-        assert_eq!(calc_crc(&msg), 0xB663);
-
-        let msg = vec![0x01, 0x03, 0x04, 0x00, 0x20, 0x00, 0x00];
-        assert_eq!(calc_crc(&msg), 0xFBF9);
-    }
 
     #[test]
     fn test_get_request_pdu_len() {

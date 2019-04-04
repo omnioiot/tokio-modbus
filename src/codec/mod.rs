@@ -5,6 +5,7 @@ pub mod rtu;
 pub mod tcp;
 
 use crate::frame::*;
+use modbus_core as mb;
 
 use byteorder::ReadBytesExt;
 use bytes::{BigEndian, BufMut, Bytes, BytesMut};
@@ -348,40 +349,24 @@ impl TryFrom<Bytes> for ResponsePdu {
 }
 
 fn bool_to_coil(state: bool) -> u16 {
-    if state {
-        0xFF00
-    } else {
-        0x0000
-    }
+    mb::util::bool_to_u16_coil(state)
 }
 
 fn coil_to_bool(coil: u16) -> io::Result<bool> {
-    match coil {
-        0xFF00 => Ok(true),
-        0x0000 => Ok(false),
-        _ => Err(Error::new(ErrorKind::InvalidData, "Invalid coil value: {}")),
-    }
-}
-
-fn packed_coils_len(bitcount: usize) -> usize {
-    (bitcount + 7) / 8
+    mb::util::u16_coil_to_bool(coil)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))
 }
 
 fn pack_coils(coils: &[Coil]) -> Vec<u8> {
-    let packed_size = packed_coils_len(coils.len());
+    let packed_size = mb::util::packed_coils_len(coils.len());
     let mut res = vec![0; packed_size];
-    for (i, b) in coils.iter().enumerate() {
-        let v = if *b { 0b1 } else { 0b0 };
-        res[(i / 8) as usize] |= v << (i % 8);
-    }
+    mb::util::pack_coils(coils, &mut res).unwrap();
     res
 }
 
 fn unpack_coils(bytes: &[u8], count: u16) -> Vec<Coil> {
-    let mut res = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        res.push((bytes[(i / 8u16) as usize] >> (i % 8)) & 0b1 > 0);
-    }
+    let mut res = vec![false; count as usize];
+    mb::util::unpack_coils(bytes, count, &mut res).unwrap();
     res
 }
 
@@ -426,7 +411,7 @@ fn request_byte_count(req: &Request) -> usize {
         | ReadHoldingRegisters(_, _)
         | WriteSingleRegister(_, _)
         | WriteSingleCoil(_, _) => 5,
-        WriteMultipleCoils(_, ref coils) => 6 + packed_coils_len(coils.len()),
+        WriteMultipleCoils(_, ref coils) => 6 + mb::util::packed_coils_len(coils.len()),
         WriteMultipleRegisters(_, ref data) => 6 + data.len() * 2,
         ReadWriteMultipleRegisters(_, _, _, ref data) => 10 + data.len() * 2,
         Custom(_, ref data) => 1 + data.len(),
@@ -436,7 +421,9 @@ fn request_byte_count(req: &Request) -> usize {
 fn response_byte_count(rsp: &Response) -> usize {
     use crate::frame::Response::*;
     match *rsp {
-        ReadCoils(ref coils) | ReadDiscreteInputs(ref coils) => 2 + packed_coils_len(coils.len()),
+        ReadCoils(ref coils) | ReadDiscreteInputs(ref coils) => {
+            2 + mb::util::packed_coils_len(coils.len())
+        }
         WriteSingleCoil(_) => 3,
         WriteMultipleCoils(_, _) | WriteMultipleRegisters(_, _) | WriteSingleRegister(_, _) => 5,
         ReadInputRegisters(ref data)
