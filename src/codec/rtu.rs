@@ -3,109 +3,17 @@ use super::*;
 use crate::frame::rtu::*;
 use crate::slave::SlaveId;
 
-use bytes::{BigEndian, BufMut, Bytes, BytesMut};
-use log::{debug, error, warn};
+use bytes::{BufMut, Bytes, BytesMut};
+use log::error;
 use modbus_core::{self as mb, rtu::crc16};
-use smallvec::SmallVec;
-use std::io::{Cursor, Error, ErrorKind, Result};
+use std::io::{Error, ErrorKind, Result};
 use tokio_codec::{Decoder, Encoder};
 
-// [MODBUS over Serial Line Specification and Implementation Guide V1.02](http://modbus.org/docs/Modbus_over_serial_line_V1_02.pdf), page 13
-// "The maximum size of a MODBUS RTU frame is 256 bytes."
-const MAX_FRAME_LEN: usize = 256;
-
-type DroppedBytes = SmallVec<[u8; MAX_FRAME_LEN]>;
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct FrameDecoder {
-    dropped_bytes: SmallVec<[u8; MAX_FRAME_LEN]>,
-}
-
-impl Default for FrameDecoder {
-    fn default() -> Self {
-        Self {
-            dropped_bytes: DroppedBytes::new(),
-        }
-    }
-}
-
-impl FrameDecoder {
-    pub fn decode(
-        &mut self,
-        buf: &mut BytesMut,
-        pdu_len: usize,
-    ) -> Result<Option<(SlaveId, Bytes)>> {
-        let adu_len = 1 + pdu_len;
-        if buf.len() >= adu_len + 2 {
-            let mut adu_buf = buf.split_to(adu_len);
-            let crc_buf = buf.split_to(2);
-            // Read trailing CRC and verify ADU
-            match Cursor::new(&crc_buf).read_u16::<BigEndian>() {
-                Ok(crc) => match check_crc(&adu_buf, crc) {
-                    Ok(()) => {
-                        if !self.dropped_bytes.is_empty() {
-                            warn!(
-                                "Successfully decoded frame after dropping {} byte(s): {:X?}",
-                                self.dropped_bytes.len(),
-                                self.dropped_bytes
-                            );
-                            self.dropped_bytes.clear();
-                        }
-                        let slave_id = adu_buf.split_to(1)[0];
-                        let pdu_data = adu_buf.freeze();
-                        return Ok(Some((slave_id, pdu_data)));
-                    }
-                    Err(err) => Err(err),
-                },
-                Err(err) => Err(err),
-            }
-            .map_err(|err| {
-                // Restore the input buffer
-                let rem_buf = buf.take();
-                debug_assert!(buf.is_empty());
-                buf.unsplit(adu_buf);
-                buf.unsplit(crc_buf);
-                buf.unsplit(rem_buf);
-                err
-            })
-        } else {
-            // Incomplete frame
-            Ok(None)
-        }
-    }
-
-    pub fn recover_on_error(&mut self, buf: &mut BytesMut) -> Result<Option<(SlaveId, Bytes)>> {
-        // If decoding failed the buffer cannot be empty
-        debug_assert!(!buf.is_empty());
-        // Skip and record the first byte of the buffer
-        {
-            let first = buf.first().unwrap();
-            debug!("Dropped first byte: {:X?}", first);
-            if self.dropped_bytes.len() >= MAX_FRAME_LEN {
-                error!(
-                    "Giving up to decode frame after dropping {} byte(s): {:X?}",
-                    self.dropped_bytes.len(),
-                    self.dropped_bytes
-                );
-                self.dropped_bytes.clear();
-            }
-            self.dropped_bytes.push(*first);
-        }
-        buf.advance(1);
-        // Assume incomplete frame and try again
-        Ok(None)
-    }
-}
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct RequestDecoder;
 
 #[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct RequestDecoder {
-    frame_decoder: FrameDecoder,
-}
-
-#[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct ResponseDecoder {
-    frame_decoder: FrameDecoder,
-}
+pub(crate) struct ResponseDecoder;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct ClientCodec {
@@ -117,61 +25,22 @@ pub(crate) struct ServerCodec {
     pub(crate) decoder: RequestDecoder,
 }
 
-fn get_request_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
-    mb::rtu::request_pdu_len(adu_buf)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))
-}
-
-fn get_response_pdu_len(adu_buf: &BytesMut) -> Result<Option<usize>> {
-    mb::rtu::response_pdu_len(adu_buf)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))
-}
-
-fn check_crc(adu_data: &[u8], expected_crc: u16) -> Result<()> {
-    let actual_crc = crc16(&adu_data);
-    if expected_crc != actual_crc {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "Invalid CRC: expected = 0x{:0>4X}, actual = 0x{:0>4X}",
-                expected_crc, actual_crc
-            ),
-        ));
-    }
-    Ok(())
-}
-
 impl Decoder for RequestDecoder {
     type Item = (SlaveId, Bytes);
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<(SlaveId, Bytes)>> {
-        loop {
-            let mut retry = false;
-            let res = get_request_pdu_len(buf)
-                .and_then(|pdu_len| {
-                    retry = false;
-                    if let Some(pdu_len) = pdu_len {
-                        self.frame_decoder.decode(buf, pdu_len)
-                    } else {
-                        // Incomplete frame
-                        Ok(None)
-                    }
+        //TODO do not clone the buffer
+        mb::rtu::decode(mb::rtu::DecoderType::Request, &buf.clone())
+            .map(|res| {
+                res.map(|(frame, location)| {
+                    let mut res = Bytes::new();
+                    res.extend_from_slice(frame.pdu);
+                    buf.split_to(location.start + location.size);
+                    (frame.slave, res)
                 })
-                .or_else(|err| {
-                    warn!("Failed to decode request frame: {}", err);
-                    match self.frame_decoder.recover_on_error(buf) {
-                        Ok(None) => {
-                            retry = true;
-                            Ok(None)
-                        }
-                        other => other,
-                    }
-                });
-            if !retry {
-                return res;
-            }
-        }
+            })
+            .map_err(|err| Error::new(ErrorKind::InvalidData, format!("{}", err)))
     }
 }
 
@@ -180,32 +49,17 @@ impl Decoder for ResponseDecoder {
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<(SlaveId, Bytes)>> {
-        loop {
-            let mut retry = false;
-            let res = get_response_pdu_len(buf)
-                .and_then(|pdu_len| {
-                    retry = false;
-                    if let Some(pdu_len) = pdu_len {
-                        self.frame_decoder.decode(buf, pdu_len)
-                    } else {
-                        // Incomplete frame
-                        Ok(None)
-                    }
+        //TODO do not clone the buffer
+        mb::rtu::decode(mb::rtu::DecoderType::Response, &buf.clone())
+            .map(|res| {
+                res.map(|(frame, location)| {
+                    let mut res = Bytes::new();
+                    res.extend_from_slice(frame.pdu);
+                    buf.split_to(location.start + location.size);
+                    (frame.slave, res)
                 })
-                .or_else(|err| {
-                    warn!("Failed to decode response frame: {}", err);
-                    match self.frame_decoder.recover_on_error(buf) {
-                        Ok(None) => {
-                            retry = true;
-                            Ok(None)
-                        }
-                        other => other,
-                    }
-                });
-            if !retry {
-                return res;
-            }
-        }
+            })
+            .map_err(|err| Error::new(ErrorKind::InvalidData, format!("{}", err)))
     }
 }
 
@@ -309,140 +163,6 @@ impl Encoder for ServerCodec {
 mod tests {
     use super::*;
     use bytes::Bytes;
-
-    #[test]
-    fn test_get_request_pdu_len() {
-        let mut buf = BytesMut::new();
-
-        buf.extend_from_slice(&[0x66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(get_request_pdu_len(&buf).is_err());
-
-        buf[1] = 0x01;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x02;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x03;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x04;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x05;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x06;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x07;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(1));
-
-        // TODO: 0x08
-
-        buf[1] = 0x0B;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(1));
-
-        buf[1] = 0x0C;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(1));
-
-        buf[1] = 0x0F;
-        buf[4] = 99;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(105));
-
-        buf[1] = 0x10;
-        buf[4] = 99;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(105));
-
-        buf[1] = 0x11;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(1));
-
-        // TODO: 0x14
-
-        // TODO: 0x15
-
-        buf[1] = 0x16;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(7));
-
-        buf[1] = 0x17;
-        buf[10] = 99; // write byte count
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(109));
-
-        buf[1] = 0x18;
-        assert_eq!(get_request_pdu_len(&buf).unwrap(), Some(3));
-
-        // TODO: 0x2B
-    }
-
-    #[test]
-    fn test_get_response_pdu_len() {
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[0x66, 0x01, 99]);
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[0x66, 0x00, 99, 0x00]);
-        assert!(get_response_pdu_len(&buf).is_err());
-
-        buf[1] = 0x01;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        buf[1] = 0x02;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        buf[1] = 0x03;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        buf[1] = 0x04;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        buf[1] = 0x05;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x06;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x07;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(2));
-
-        // TODO: 0x08
-
-        buf[1] = 0x0B;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x0C;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        buf[1] = 0x0F;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(5));
-
-        buf[1] = 0x10;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(5));
-
-        // TODO: 0x11
-
-        // TODO: 0x14
-
-        // TODO: 0x15
-
-        buf[1] = 0x16;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(7));
-
-        buf[1] = 0x17;
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(101));
-
-        buf[1] = 0x18;
-        buf[2] = 0x01; // byte count Hi
-        buf[3] = 0x00; // byte count Lo
-        assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(259));
-
-        // TODO: 0x2B
-
-        for i in 0x81..0xAB {
-            buf[1] = i;
-            assert_eq!(get_response_pdu_len(&buf).unwrap(), Some(2));
-        }
-    }
 
     mod client {
 
