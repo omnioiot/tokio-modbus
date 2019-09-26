@@ -1,10 +1,10 @@
 use crate::frame::{tcp::*, *};
 use crate::proto::tcp::Proto;
 
-use futures::Future;
+use crate::server::tcp_server::TcpServer;
+use futures::{self, Future};
 use std::io::Error;
 use std::net::SocketAddr;
-use tokio_proto::TcpServer;
 use tokio_service::{NewService, Service};
 
 struct ServiceWrapper<S> {
@@ -73,11 +73,27 @@ impl Server {
         S::Error: Into<Error>,
         S::Instance: Send + Sync + 'static,
     {
+        self.serve_until(service, futures::empty());
+    }
+
+    /// Start a Modbus TCP server that blocks the current thread.
+    pub fn serve_until<S, Sd>(self, service: S, shutdown_signal: Sd)
+    where
+        S: NewService + Send + Sync + 'static,
+        Sd: Future<Item = (), Error = std::io::Error> + Sync + Send + 'static,
+        S::Request: From<Request>,
+        S::Response: Into<Response>,
+        S::Error: Into<Error>,
+        S::Instance: Send + Sync + 'static,
+    {
         let mut server = TcpServer::new(Proto, self.socket_addr);
         if let Some(threads) = self.threads {
             server.threads(threads);
         }
-        server.serve(move || Ok(ServiceWrapper::new(service.new_service()?)));
+        server.serve_until(
+            move || Ok(ServiceWrapper::new(service.new_service()?)),
+            shutdown_signal,
+        );
     }
 }
 
