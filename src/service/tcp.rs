@@ -39,6 +39,16 @@ pub(crate) struct Context {
     transaction_id: Cell<TransactionId>,
 }
 
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        println!("drop");
+        if let Err(err) = self.service.get_mut().shutdown(std::net::Shutdown::Both) {
+            println!("Failed to shutdown tcp stream: {:?}", err);
+        }
+    }
+}
+
 impl Context {
     fn new(service: Framed<TcpStream, codec::tcp::ClientCodec>, unit_id: UnitId) -> Self {
         Self {
